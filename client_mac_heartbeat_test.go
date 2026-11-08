@@ -119,11 +119,21 @@ func TestMACHeartbeatFallsBackToServerInfo(t *testing.T) {
 }
 
 func TestMACHeartbeatFallsBackToTCPKeepalive(t *testing.T) {
-	// 两种协议都返回非法负载：应禁用 MAC 应用层心跳，但保留连接，交给 TCP keepalive。
+	// 两种协议都返回非法负载：连续失败达到阈值后才禁用 MAC 应用层心跳，
+	// 但连接始终保留，交给 TCP keepalive。
 	addr, stop := fakeMACHeartbeatServer(t, []byte{1}, []byte{1})
 	defer stop()
 
 	client := newMACHeartbeatTestClient(t, addr)
+	for i := 0; i < macHeartbeatDisableThreshold-1; i++ {
+		client.heartbeatPool()
+		client.mu.Lock()
+		disabled := client.macHeartbeatDisabled
+		client.mu.Unlock()
+		if disabled {
+			t.Fatalf("MAC heartbeat disabled too early at attempt %d", i+1)
+		}
+	}
 	client.heartbeatPool()
 
 	client.mu.Lock()
@@ -132,7 +142,7 @@ func TestMACHeartbeatFallsBackToTCPKeepalive(t *testing.T) {
 		t.Fatalf("connection should stay in pool after heartbeat fallback, got %d", len(client.pool))
 	}
 	if !client.macHeartbeatDisabled {
-		t.Fatal("MAC application heartbeat should be disabled after both protocols fail")
+		t.Fatal("MAC application heartbeat should be disabled after repeated protocol failures")
 	}
 }
 
