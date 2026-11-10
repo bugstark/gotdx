@@ -1843,9 +1843,9 @@ func (client *Client) probeFirstReachable(addresses []string, timeout time.Durat
 
 // probeReachable 探活验证候选地址：先并发拨号筛选（单次拨号超时 `timeout`），再对
 // 拨号可达的地址并发执行当前模式握手。返回结果覆盖所有拨号成功的地址：握手成功者
-// 在前（按拨号加握手总耗时升序），仅拨号成功但握手失败者排后（按拨号耗时升序），
-// 供建池逐级回退时优先尝试已验证可用的地址。握手协议不存在的模式（MAC）以拨号
-// 成功即判定可用。
+// 在前（按实际探测耗时升序），仅拨号成功但握手失败者排后（按拨号耗时升序），
+// 供建池逐级回退时优先尝试已验证可用的地址。MAC 模式额外执行一次真实
+// MACSymbolBars 请求，避免把“TCP 拨号快、K线业务慢”的节点误判为最快节点。
 func (client *Client) probeReachable(addresses []string, timeout time.Duration) []probeResult {
 	if len(addresses) == 0 {
 		return nil
@@ -1897,6 +1897,11 @@ func (client *Client) probeReachable(addresses []string, timeout time.Duration) 
 			pc.mu.Lock()
 			_, hErr := client.handshakeOn(pc)
 			pc.mu.Unlock()
+			if hErr == nil && client.mode == clientModeMacMain {
+				// MAC 没有可用的协议握手，不能以 TCP 拨号成功代表业务可用；
+				// 用一次真实 K 线请求把候选节点的业务耗时计入排序。
+				hErr = client.probeMACBusiness(conn)
+			}
 			_ = conn.Close()
 			if hErr != nil {
 				return
@@ -1930,6 +1935,25 @@ func (client *Client) probeReachable(addresses []string, timeout time.Duration) 
 		return merged[i].latency < merged[j].latency
 	})
 	return merged
+}
+
+// probeMACBusiness 在候选连接上执行一次真实 MAC K 线请求，作为 MAC 主机的业务探活。
+// 只测 K 线可用性与耗时，不参与请求计数/熔断；用于 rebalance 选路，避免仅凭 TCP 拨号
+// 把“连接快、K线慢”的节点排到前面。
+func (client *Client) probeMACBusiness(conn net.Conn) error {
+	protocol := proto.NewMACSymbolBars(&proto.MACSymbolBarsRequest{
+		Market: uint16(types.MarketSH),
+		Code:   makeMACCode22Client("600519"),
+		Period: uint16(types.KLINE_TYPE_DAILY),
+		Times:  1,
+		Count:  30,
+		Adjust: types.AdjustQFQ,
+	})
+	header, payload, err := client.exchange(conn, protocol)
+	if err != nil {
+		return err
+	}
+	return protocol.ParseResponse(header, payload)
 }
 
 // ConnectEx 连接扩展市场服务器并完成登录握手。
