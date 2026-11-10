@@ -137,6 +137,18 @@ func TestSelectHostTargetCooldown(t *testing.T) {
 	}
 }
 
+func TestWithHostSwitchObserverOption(t *testing.T) {
+	called := false
+	c := newClientWithOptions(applyOptions(WithHostSwitchObserver(func(HostSwitchEvent) { called = true })), clientModeMacMain)
+	if c.opt.OnHostSwitch == nil {
+		t.Fatal("observer not set")
+	}
+	c.opt.OnHostSwitch(HostSwitchEvent{From: "a", To: "b"})
+	if !called {
+		t.Fatal("observer was not called")
+	}
+}
+
 func TestSelectHostTargetCurrentUnavailable(t *testing.T) {
 	views := []hostHealthView{
 		testHostView("a:1", 100*time.Millisecond, 0, false),
