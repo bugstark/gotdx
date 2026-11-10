@@ -24,6 +24,16 @@ const (
 	hostFailurePenalty       = 500 * time.Millisecond
 )
 
+// HostSwitchEvent 描述一次已经完成的 MAC 主机切换。
+type HostSwitchEvent struct {
+	From      string
+	To        string
+	Reason    string
+	FromScore time.Duration
+	ToScore   time.Duration
+	At        time.Time
+}
+
 // hostHealth 是单个地址的 K 线业务延迟统计。
 type hostHealth struct {
 	samples       []time.Duration

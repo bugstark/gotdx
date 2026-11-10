@@ -45,6 +45,8 @@ type Options struct {
 	GuardFailThreshold     int           // 熔断阈值：同一命令码连续失败多少次打开熔断；构造阶段由默认值 5 填充，非正数回退默认
 	GuardOpenTimeout       time.Duration // 熔断冷却时长：打开后冷却多久放行单个试探请求；零或负数回退默认 5 秒
 	FuturesCalendarPath    string        // 期货交易日历 SQLite 路径；为空时不转换 MAC 期货自然时间
+	// OnHostSwitch 在 MAC 连接池真正完成一次主机切换后回调；仅用于日志/指标。
+	OnHostSwitch func(HostSwitchEvent)
 }
 
 // defaultOptions 构造内置默认配置：各站点使用内置主机列表与兜底地址，并设置默认重试次数、超时与日历路径。
@@ -173,6 +175,14 @@ func WithTimeoutSec(timeoutSec int) Option {
 func WithFuturesCalendarPath(path string) Option {
 	return func(o *Options) {
 		o.FuturesCalendarPath = path
+	}
+}
+
+// WithHostSwitchObserver 设置主机切换观察器；只在连接池真正完成切换后回调，
+// 健康探测本身不回调，避免日志刷屏。回调应快速返回，不得阻塞请求路径。
+func WithHostSwitchObserver(observer func(HostSwitchEvent)) Option {
+	return func(o *Options) {
+		o.OnHostSwitch = observer
 	}
 }
 

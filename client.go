@@ -1190,6 +1190,8 @@ func (client *Client) rebalancePool(forceFullProbe bool) {
 	verified := client.probeReachable(candidates, probeTimeout)
 	var fastest string
 	var fastestLat time.Duration
+	var switchReason string
+	var switchFromScore, switchToScore time.Duration
 	latByAddr := make(map[string]time.Duration, len(verified))
 	reachable := make([]string, 0, len(verified))
 
@@ -1216,10 +1218,19 @@ func (client *Client) rebalancePool(forceFullProbe bool) {
 			}
 			views = append(views, view)
 		}
-		target, _ := selectHostTarget(curAddr, views, &client.hostSwitch, time.Now())
+		target, reason := selectHostTarget(curAddr, views, &client.hostSwitch, time.Now())
 		if target == "" {
 			client.mu.Unlock()
 			return
+		}
+		switchReason = reason
+		for _, v := range views {
+			if v.Address == curAddr {
+				switchFromScore = v.Score
+			}
+			if v.Address == target {
+				switchToScore = v.Score
+			}
 		}
 		fastest = target
 		fastestLat = latByAddr[target]
@@ -1388,6 +1399,16 @@ func (client *Client) rebalancePool(forceFullProbe bool) {
 		client.hostSwitch.streak = 0
 	}
 	client.mu.Unlock()
+	if client.mode == clientModeMacMain && client.opt.OnHostSwitch != nil && curAddr != "" && curAddr != fastest {
+		client.opt.OnHostSwitch(HostSwitchEvent{
+			From:      curAddr,
+			To:        fastest,
+			Reason:    switchReason,
+			FromScore: switchFromScore,
+			ToScore:   switchToScore,
+			At:        time.Now(),
+		})
+	}
 	for _, pc := range old {
 		_ = pc.conn.Close()
 	}
