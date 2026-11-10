@@ -1,16 +1,17 @@
 package main
 
-// macscan 从一组任意 host 中筛选真正支持 MAC 协议、且 K 线请求较快的节点。
+// macscan 从一组任意 host 中筛选真正支持 MAC 协议、且响应较快的节点。
 //
 // 用法：
-//   go run ./cmd/macscan -file hosts.txt -samples 3 -count 30 -concurrency 8
+//   go run ./cmd/macscan -file hosts.txt -samples 3 -count 5 -board 880515
 //   go run ./cmd/macscan -file - < hosts.txt
 //
 // hosts.txt 每行可以是：
 //   public-ip-xxxx:7709
 //   ('深圳双线主站1', 'public-ip-xxxx', 7709)
 //   public-ip-yyyy
-// 空的端口默认补 7709。工具会去重，并用真实 MACSymbolBars 请求验证协议，
+// 空的端口默认补 7709。工具会去重，并用 MAC 独有的板块成分股接口
+// MACBoardMembersQuotesDynamicWithFilter("880515", ...) 验证协议，
 // 不支持 MAC 的 host 不会计入可用结果。
 
 import (
@@ -26,7 +27,6 @@ import (
 	"time"
 
 	"github.com/bensema/gotdx"
-	tdxtypes "github.com/bensema/gotdx/types"
 )
 
 type hostResult struct {
@@ -49,8 +49,9 @@ var bareHostRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*(?::\d+)?$`)
 func main() {
 	var (
 		file        = flag.String("file", "", "host 列表文件；传 - 表示 stdin")
-		samples     = flag.Int("samples", 3, "每个 host 的 K 线采样次数")
-		count       = flag.Uint("count", 30, "MACSymbolBars 请求根数")
+		board       = flag.String("board", "880515", "MAC 板块代码（默认 880515）")
+		samples     = flag.Int("samples", 3, "每个 host 的板块成分股采样次数")
+		count       = flag.Uint("count", 5, "每次请求的板块成分股条数")
 		concurrency = flag.Int("concurrency", 8, "并发探测 host 数")
 		timeout     = flag.Duration("timeout", 3*time.Second, "单次连接/请求超时")
 		top         = flag.Int("top", 0, "只显示前 N 个可用 host；0 显示全部")
@@ -72,13 +73,13 @@ func main() {
 		*samples = 1
 	}
 	if *count == 0 {
-		*count = 30
+		*count = 5
 	}
 	if *concurrency <= 0 {
 		*concurrency = 1
 	}
 
-	results := scanHosts(hosts, *samples, uint32(*count), *timeout, *concurrency)
+	results := scanHosts(hosts, *samples, *board, uint32(*count), *timeout, *concurrency)
 	sortResults(results)
 	if *top > 0 && len(results) > *top {
 		results = results[:*top]
@@ -176,7 +177,7 @@ func normalizeHost(raw string) string {
 	return h
 }
 
-func scanHosts(hosts []string, samples int, count uint32, timeout time.Duration, concurrency int) []hostResult {
+func scanHosts(hosts []string, samples int, board string, count uint32, timeout time.Duration, concurrency int) []hostResult {
 	results := make([]hostResult, 0, len(hosts))
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -188,7 +189,7 @@ func scanHosts(hosts []string, samples int, count uint32, timeout time.Duration,
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			r := probeHost(host, samples, count, timeout)
+			r := probeHost(host, samples, board, count, timeout)
 			mu.Lock()
 			results = append(results, r)
 			mu.Unlock()
@@ -198,7 +199,7 @@ func scanHosts(hosts []string, samples int, count uint32, timeout time.Duration,
 	return results
 }
 
-func probeHost(host string, samples int, count uint32, timeout time.Duration) hostResult {
+func probeHost(host string, samples int, board string, count uint32, timeout time.Duration) hostResult {
 	r := hostResult{Host: host}
 	if timeout <= 0 {
 		timeout = 3 * time.Second
@@ -220,12 +221,15 @@ func probeHost(host string, samples int, count uint32, timeout time.Duration) ho
 
 	for i := 0; i < samples; i++ {
 		reqStarted := time.Now()
-		_, err := c.MACSymbolBars(
-			uint8(tdxtypes.MarketSH), "600519", uint16(tdxtypes.KLINE_TYPE_DAILY),
-			1, 0, count, tdxtypes.AdjustQFQ,
+		reply, err := c.MACBoardMembersQuotesDynamicWithFilter(
+			board, count, 14, 1, gotdx.DefaultMACBoardMembersQuotesFieldBitmap(),
 		)
 		if err != nil {
 			r.LastError = err.Error()
+			return r
+		}
+		if reply == nil || len(reply.Stocks) == 0 {
+			r.LastError = fmt.Sprintf("MAC board %s returned no members", board)
 			return r
 		}
 		r.lastLatency = append(r.lastLatency, time.Since(reqStarted))
