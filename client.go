@@ -105,6 +105,8 @@ type Client struct {
 	decimalPointsLoaded  map[uint8]bool
 	lastReachable        []string                   // 最近一次探活确认可达的地址列表，按测得耗时升序，供重平衡与补建收敛候选
 	addrLatency          map[string]time.Duration   // 各地址最近一次建连测得的拨号+握手总耗时，供候选排序与后台预比较；池锁保护
+	hostHealth           map[string]*hostHealth     // MAC 地址的 K 线业务健康统计（EWMA/p95/失败次数）；池锁保护
+	hostSwitch           hostSwitchState            // 连续确认、候选与切换冷却状态；池锁保护
 	dialSamples          []time.Duration            // 最近若干次成功建连耗时样本（环形窗口），供快路径超时取中位数自适应；池锁保护
 	health               map[string]*nodeHealth     // 各地址连续空数据健康度统计，定向借出对降权节点跳过；池锁保护
 	heartbeatLatency     map[string]time.Duration   // 各地址最近一次心跳往返耗时，供慢连接判定与池内分布比较；池锁保护
@@ -1188,41 +1190,80 @@ func (client *Client) rebalancePool(forceFullProbe bool) {
 	verified := client.probeReachable(candidates, probeTimeout)
 	var fastest string
 	var fastestLat time.Duration
-	// 健康节点优先选出最快者；全部可达节点均被降权时再回退到任意最快可达节点兜底。
-	healthyFastest, healthyLat := "", time.Duration(0)
 	latByAddr := make(map[string]time.Duration, len(verified))
 	reachable := make([]string, 0, len(verified))
-	for _, r := range verified {
-		if !r.reachable {
-			continue
-		}
-		latByAddr[r.address] = r.latency
-		reachable = append(reachable, r.address)
-		if degraded[r.address] {
-			continue
-		}
-		if healthyFastest == "" || r.latency < healthyLat {
-			healthyFastest, healthyLat = r.address, r.latency
-		}
-	}
-	fastest, fastestLat = healthyFastest, healthyLat
-	if fastest == "" {
+
+	if client.mode == clientModeMacMain {
+		client.mu.Lock()
 		for _, r := range verified {
 			if r.reachable {
-				fastest, fastestLat = r.address, r.latency
-				break
+				latByAddr[r.address] = r.latency
+				reachable = append(reachable, r.address)
+				client.recordHostSampleLocked(r.address, r.latency)
+			} else {
+				client.recordHostFailureLocked(r.address)
 			}
 		}
+		curAddr := ""
+		if len(client.pool) > 0 {
+			curAddr = client.pool[0].addr
+		}
+		views := make([]hostHealthView, 0, len(verified))
+		for _, r := range verified {
+			view := client.hostHealthViewLocked(r.address, r.reachable, latByAddr[r.address])
+			if degraded[r.address] {
+				view.Reachable = false
+			}
+			views = append(views, view)
+		}
+		target, _ := selectHostTarget(curAddr, views, &client.hostSwitch, time.Now())
+		if target == "" {
+			client.mu.Unlock()
+			return
+		}
+		fastest = target
+		fastestLat = latByAddr[target]
+		client.mu.Unlock()
+	} else {
+		// 健康节点优先选出最快者；全部可达节点均被降权时再回退到任意最快可达节点兜底。
+		healthyFastest, healthyLat := "", time.Duration(0)
+		for _, r := range verified {
+			if !r.reachable {
+				continue
+			}
+			latByAddr[r.address] = r.latency
+			reachable = append(reachable, r.address)
+			if degraded[r.address] {
+				continue
+			}
+			if healthyFastest == "" || r.latency < healthyLat {
+				healthyFastest, healthyLat = r.address, r.latency
+			}
+		}
+		fastest, fastestLat = healthyFastest, healthyLat
+		if fastest == "" {
+			for _, r := range verified {
+				if r.reachable {
+					fastest, fastestLat = r.address, r.latency
+					break
+				}
+			}
+		}
+		client.mu.Lock()
+		if len(reachable) > 0 {
+			client.lastReachable = reachable
+			for _, r := range verified {
+				if r.reachable {
+					client.recordAddrLatencyLocked(r.address, r.latency)
+				}
+			}
+		}
+		client.mu.Unlock()
 	}
+
 	client.mu.Lock()
-	if len(reachable) > 0 {
+	if len(reachable) > 0 && client.mode == clientModeMacMain {
 		client.lastReachable = reachable
-		// 同步刷新各地址测得耗时，供快路径后台预比较与补建候选排序使用。
-		for _, r := range verified {
-			if r.reachable {
-				client.recordAddrLatencyLocked(r.address, r.latency)
-			}
-		}
 	}
 	curAddr := ""
 	if len(client.pool) > 0 {
@@ -1234,27 +1275,26 @@ func (client *Client) rebalancePool(forceFullProbe bool) {
 		return
 	}
 
-	// 动态切换阈值：当前节点已被心跳标记为慢连接，或其建连耗时达到池内中位数的慢节点
-	// 倍数时，放宽到低 10% 即迁出；其余情况维持默认低 30% 的保守阈值，避免网络抖动
-	// 造成 `fastest` 频繁漂移、每分钟重建连接（建连风暴）。样本不足（中位数为 0）时不按
-	// 分布判慢，保持改动前行为；当前节点已被健康度降权时同样跳过延迟阈值直接迁出。
-	switchRatio := rebalanceSwitchRatio
-	client.mu.Lock()
-	median := medianLatencyLocked(client.addrLatency, poolAddrs)
-	curSlow := slowMarked[curAddr]
-	client.mu.Unlock()
-	if median > 0 {
-		if curLat, ok := latByAddr[curAddr]; ok && curLat > 0 && curLat >= time.Duration(slowNodeRatio*float64(median)) {
-			curSlow = true
+	// 非 MAC 保留原有拨号延迟策略；MAC 已由 HostHealth 的 K 线业务评分决定 target。
+	if client.mode != clientModeMacMain {
+		switchRatio := rebalanceSwitchRatio
+		client.mu.Lock()
+		median := medianLatencyLocked(client.addrLatency, poolAddrs)
+		curSlow := slowMarked[curAddr]
+		client.mu.Unlock()
+		if median > 0 {
+			if curLat, ok := latByAddr[curAddr]; ok && curLat > 0 && curLat >= time.Duration(slowNodeRatio*float64(median)) {
+				curSlow = true
+			}
 		}
-	}
-	if curSlow {
-		switchRatio = slowNodeSwitchRatio
-	}
-	if curAddr != "" && !degraded[curAddr] {
-		if curLat, ok := latByAddr[curAddr]; ok && curLat > 0 && fastestLat >= time.Duration(float64(curLat)*switchRatio) {
-			// 新节点未达到当前阈值：保持现有连接不动，请求继续稳定走当前节点。
-			return
+		if curSlow {
+			switchRatio = slowNodeSwitchRatio
+		}
+		if curAddr != "" && !degraded[curAddr] {
+			if curLat, ok := latByAddr[curAddr]; ok && curLat > 0 && fastestLat >= time.Duration(float64(curLat)*switchRatio) {
+				// 新节点未达到当前阈值：保持现有连接不动，请求继续稳定走当前节点。
+				return
+			}
 		}
 	}
 
@@ -1342,6 +1382,11 @@ func (client *Client) rebalancePool(forceFullProbe bool) {
 	}
 	// 切换后清空旧地址慢标记：新池地址尚未经历心跳判慢，避免旧标记残留继续放宽阈值。
 	client.slow = make(map[string]bool)
+	if client.mode == clientModeMacMain {
+		client.hostSwitch.lastSwitchAt = time.Now()
+		client.hostSwitch.candidate = ""
+		client.hostSwitch.streak = 0
+	}
 	client.mu.Unlock()
 	for _, pc := range old {
 		_ = pc.conn.Close()
@@ -1946,7 +1991,7 @@ func (client *Client) probeMACBusiness(conn net.Conn) error {
 		Code:   makeMACCode22Client("600519"),
 		Period: uint16(types.KLINE_TYPE_DAILY),
 		Times:  1,
-		Count:  30,
+		Count:  360,
 		Adjust: types.AdjustQFQ,
 	})
 	header, payload, err := client.exchange(conn, protocol)
