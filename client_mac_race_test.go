@@ -22,7 +22,6 @@ func TestMACHeartbeatAcquireRace(t *testing.T) {
 
 	client := NewMAC(
 		WithMacTCPAddress(addr),
-		WithMacTCPAddressPool(),
 		WithPoolSize(20),
 		WithTimeoutSec(2),
 	)

@@ -68,7 +68,6 @@ func newMACHeartbeatTestClient(t *testing.T, addr string) *Client {
 	t.Helper()
 	client := NewMAC(
 		WithMacTCPAddress(addr),
-		WithMacTCPAddressPool(),
 		WithPoolSize(1),
 		WithTimeoutSec(2),
 	)
