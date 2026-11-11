@@ -689,6 +689,9 @@ func TestMACQuotesBuildRequestAndParseResponse(t *testing.T) {
 	if len(reply.ChartData) != 2 || reply.ChartData[0].Time != "09:31:00" || reply.ChartData[1].Vol != 2234 {
 		t.Fatalf("unexpected chart data: %+v", reply.ChartData)
 	}
+	if got := reply.ChartData[0].DateTime.Format(time.DateTime); got != "2026-04-18 09:31:00" {
+		t.Fatalf("first chart DateTime=%q, want 2026-04-18 09:31:00", got)
+	}
 	assertNearFloat64(t, reply.Close, 10.5, "close")
 	assertNearFloat64(t, reply.Turnover, 2.5, "turnover")
 	assertNearFloat64(t, reply.Avg, 10.2, "avg")
