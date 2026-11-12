@@ -149,6 +149,19 @@ func TestWithHostSwitchObserverOption(t *testing.T) {
 	}
 }
 
+func TestSelectHostTargetEmergencyOnCurrentFailures(t *testing.T) {
+	views := []hostHealthView{
+		testHostView("a:1", 100*time.Millisecond, 5, true),
+		testHostView("b:1", 70*time.Millisecond, 5, true),
+	}
+	views[0].Failures = hostSwitchEmergencyFailures
+	// 冷却期内也要允许故障切换，不能把用户继续钉在坏 host 上。
+	state := &hostSwitchState{lastSwitchAt: time.Now()}
+	if got, reason := selectHostTarget("a:1", views, state, time.Now()); got != "b:1" || reason != "current-failing" {
+		t.Fatalf("target=%q reason=%q, want b:1/current-failing", got, reason)
+	}
+}
+
 func TestSelectHostTargetCurrentUnavailable(t *testing.T) {
 	views := []hostHealthView{
 		testHostView("a:1", 100*time.Millisecond, 0, false),

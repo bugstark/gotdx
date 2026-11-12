@@ -22,6 +22,9 @@ const (
 	hostSwitchSlowHysteresis = 0.90 // 当前已出现失败/慢样本时，候选快 10% 即可
 	hostSwitchCooldown       = 10 * time.Minute
 	hostFailurePenalty       = 500 * time.Millisecond
+	// 当前 host 连续业务失败达到该次数时走紧急切换：跳过 3 轮确认和冷却，
+	// 避免慢 host 继续服务用户。正常慢速优化仍走上面的滞回策略。
+	hostSwitchEmergencyFailures = 2
 )
 
 // HostSwitchEvent 描述一次已经完成的 MAC 主机切换。
@@ -156,6 +159,12 @@ func selectHostTarget(current string, views []hostHealthView, state *hostSwitchS
 		state.streak = 0
 		return "", "current-fastest"
 	}
+	// 当前 host 已经连续业务失败：候选可达时立即切换，不等待 3 轮确认/10 分钟冷却。
+	if currentView.Failures >= hostSwitchEmergencyFailures {
+		state.candidate = ""
+		state.streak = 0
+		return best.Address, "current-failing"
+	}
 	if !state.lastSwitchAt.IsZero() && now.Sub(state.lastSwitchAt) < hostSwitchCooldown {
 		state.candidate = ""
 		state.streak = 0
@@ -195,6 +204,10 @@ func (client *Client) recordHostSampleLocked(addr string, elapsed time.Duration)
 		client.hostHealth[addr] = h
 	}
 	h.record(elapsed)
+	// 业务成功说明该地址恢复；清掉失败触发的慢标记，让重平衡周期回到正常档。
+	if client.slow != nil {
+		delete(client.slow, addr)
+	}
 }
 
 func (client *Client) recordHostFailureLocked(addr string) {
@@ -210,6 +223,11 @@ func (client *Client) recordHostFailureLocked(addr string) {
 		client.hostHealth[addr] = h
 	}
 	h.recordFailure()
+	// 让 refillLoop 的 rebalance 周期切到 15s，紧急切换不必等 1 分钟 tick。
+	if client.slow == nil {
+		client.slow = make(map[string]bool)
+	}
+	client.slow[addr] = true
 }
 
 // hostHealthViewLocked 生成单个地址的健康视图；fallback 是本次 K 线探活的实测值。
